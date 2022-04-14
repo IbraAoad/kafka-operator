@@ -4,101 +4,105 @@
 #
 # Learn more at: https://juju.is/docs/sdk
 
-"""Charm the service.
-
-Refer to the following post for a quick-start guide that will help you
-develop a new k8s charm using the Operator Framework:
-
-    https://discourse.charmhub.io/t/4208
-"""
-
 import logging
+import subprocess
+from typing import Tuple
 
 from ops.charm import CharmBase
-from ops.framework import StoredState
 from ops.main import main
-from ops.model import ActiveStatus
+from ops.model import MaintenanceStatus, ActiveStatus, BlockedStatus
+from juju.model import Model
+from juju.unit import Unit
+from juju.application import Application
+import asyncio
+
+from packages import install_packages
 
 logger = logging.getLogger(__name__)
 
 
-class OperatorTemplateCharm(CharmBase):
-    """Charm the service."""
-
-    _stored = StoredState()
-
+class KafkaCharm(CharmBase):
     def __init__(self, *args):
         super().__init__(*args)
-        self.framework.observe(self.on.httpbin_pebble_ready, self._on_httpbin_pebble_ready)
-        self.framework.observe(self.on.config_changed, self._on_config_changed)
-        self.framework.observe(self.on.fortune_action, self._on_fortune_action)
-        self._stored.set_default(things=[])
+        self.name = "kafka"
 
-    def _on_httpbin_pebble_ready(self, event):
-        """Define and start a workload using the Pebble API.
+        self.framework.observe(getattr(self.on, "install"), self._on_install)
+        # self.framework.observe(getattr(self.on, "leader_elected"), self._on_leader_elected)
+        # self.framework.observe(
+        #     getattr(self.on, "cluster_relation_joined"), self._on_cluster_relation_joined
+        # )
+        self.framework.observe(getattr(self.on, "config_changed"), self._on_config_changed)
 
-        TEMPLATE-TODO: change this example to suit your needs.
-        You'll need to specify the right entrypoint and environment
-        configuration for your specific workload. Tip: you can see the
-        standard entrypoint of an existing container using docker inspect
+    @property
+    def _relation(self):
+        return self.model.get_relation("cluster")
 
-        Learn more about Pebble layers at https://github.com/canonical/pebble
-        """
-        # Get a reference the container attribute on the PebbleReadyEvent
-        container = event.workload
-        # Define an initial Pebble layer configuration
-        pebble_layer = {
-            "summary": "httpbin layer",
-            "description": "pebble config layer for httpbin",
-            "services": {
-                "httpbin": {
-                    "override": "replace",
-                    "summary": "httpbin",
-                    "command": "gunicorn -b 0.0.0.0:80 httpbin:app -k gevent",
-                    "startup": "enabled",
-                    "environment": {"thing": self.model.config["thing"]},
-                }
-            },
-        }
-        # Add initial Pebble config layer using the Pebble API
-        container.add_layer("httpbin", pebble_layer, combine=True)
-        # Autostart any services that were defined with startup: enabled
-        container.autostart()
-        # Learn more about statuses in the SDK docs:
-        # https://juju.is/docs/sdk/constructs#heading--statuses
-        self.unit.status = ActiveStatus()
+    def _on_install(self, _) -> None:
+        self.unit.status = MaintenanceStatus("installing packages")
+        install_packages()
 
-    def _on_config_changed(self, _):
-        """Just an example to show how to deal with changed configuration.
+    # def _on_leader_elected(self, _):
+    #     zookeeper_units = [
+    #         unit_name
+    #         for unit_name in self._relation.data[self.model.app]
+    #         if self._relation.data[self.model.app][unit_name]["unit-type"] == "zookeeper"
+    #     ]
+    #
+    #     if self.unit.is_leader() and len(zookeeper_units) != self.config["num-zookeeper-units"]:
+    #
+    #         # HERE BE DRAGONS
+    #         loop = asyncio.get_event_loop()
+    #         new_zookeeper_units = loop.run_until_complete(
+    #             self._add_zookeeper_units(num_zookeeper_units=self.config["num-zookeeper-units"])
+    #         )
+    #         
+    #         # Labelling new ZK units
+    #         for zookeeper_unit in new_zookeeper_units:
+    #             self._relation.data[self.model.app][zookeeper_unit.entity_id][
+    #                 "unit-type"
+    #             ] = "zookeeper"
+    
+    def _on_cluster_relation_joined(self, event):
+        if self.unit.is_leader():
+            # Defaulting to kafka for new units
+            event.data[self.model.app][event.unit.name]["unit-type"] = self.config["unit-type"]
 
-        TEMPLATE-TODO: change this example to suit your needs.
-        If you don't need to handle config, you can remove this method,
-        the hook created in __init__.py for it, the corresponding test,
-        and the config.py file.
+    def _on_config_changed(self, _) -> None:
+        self._start_services()
 
-        Learn more about config at https://juju.is/docs/sdk/config
-        """
-        current = self.config["thing"]
-        if current not in self._stored.things:
-            logger.debug("found a new thing: %r", current)
-            self._stored.things.append(current)
+        if not isinstance(self.unit.status, BlockedStatus):
+            self.unit.status = ActiveStatus()
 
-    def _on_fortune_action(self, event):
-        """Just an example to show how to receive actions.
+    def _start_services(self) -> None:
+        if self._relation.data[self.model.app][self.unit.name]["unit-type"] == "zookeeper":
 
-        TEMPLATE-TODO: change this example to suit your needs.
-        If you don't need to handle actions, you can remove this method,
-        the hook created in __init__.py for it, the corresponding test,
-        and the actions.py file.
+            logger.info("stopping default kafka service")
+            kafka_stopped = self._run_command(["sudo", "snap", "stop", "kafka"])
+            if not kafka_stopped:
+                self.unit.status = BlockedStatus("failed to stop default kafka service")
 
-        Learn more about actions at https://juju.is/docs/sdk/actions
-        """
-        fail = event.params["fail"]
-        if fail:
-            event.fail(fail)
+            logger.info("starting zookeeper service")
+            zookeeper_started = self._run_command(["sudo", "kafka.zookeeper"])
+            if not zookeeper_started:
+                self.unit.status = BlockedStatus("failed to start zookeeper service")
         else:
-            event.set_results({"fortune": "A bug in the code is worth two in the documentation."})
+            logger.debug("unit is kafka, skipping")
+    #
+    # # HERE BE HERESY
+    # async def _add_zookeeper_units(self, num_zookeeper_units=3) -> Tuple:
+    #     model = Model()
+    #     await model.connect_current()
+    #     app = Application(entity_id=self.name, model=model)
+    #     new_zookeeper_units = await app.add_units(count=num_zookeeper_units)
+    #     return new_zookeeper_units or ()
+    #
+    def _run_command(self, cmd: list) -> bool:
+        proc = subprocess.Popen(cmd)
+        for line in iter(getattr(proc.stdout, "readline"), ""):
+            logger.debug(line)
+        proc.wait()
+        return proc.returncode == 0
 
 
 if __name__ == "__main__":
-    main(OperatorTemplateCharm)
+    main(KafkaCharm)
