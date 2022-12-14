@@ -29,6 +29,13 @@ REL_NAME_CONSUMER = "kafka-client-consumer"
 REL_NAME_PRODUCER = "kafka-client-producer"
 REL_NAME_ADMIN = "kafka-client-admin"
 
+@pytest.mark.abort_on_fail
+async def test_deploy_app(ops_test: OpsTest, app_charm):
+     await asyncio.gather(
+        ops_test.model.deploy(
+            app_charm, application_name=DUMMY_NAME_1, num_units=1, series="focal"
+        )
+    )
 
 @pytest.mark.abort_on_fail
 async def test_deploy_charms_relate_active(ops_test: OpsTest, usernames: Set[str]):
