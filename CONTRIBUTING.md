@@ -69,6 +69,12 @@ tox run -e integration   # integration tests
 tox                      # runs 'lint' and 'unit' environments
 ```
 
+To run the end-to-end tests, you first need to have a k8s and a lxd controllers
+bootstrapped, and communicate their names using environment variables:
+```shell
+K8S_CONTROLLER="k8s_ctl_name" LXD_CONTROLLER="lxd_ctl_name" tox -e e2e
+```
+
 ## Canonical Contributor Agreement
 
 Canonical welcomes contributions to the Charmed Kafka Operator. Please check out our [contributor agreement](https://ubuntu.com/legal/contributors) if you're interested in contributing to the solution.
