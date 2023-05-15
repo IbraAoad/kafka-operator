@@ -15,6 +15,7 @@ from literals import (
     REL_NAME,
     SECURITY_PROTOCOL_PORTS,
     TLS_RELATION,
+    TRUSTED_CA_RELATION,
     TRUSTED_CERTIFICATE_RELATION,
     ZK,
 )
@@ -37,6 +38,25 @@ logger = logging.getLogger(__name__)
 
 TLS_NAME = "tls-certificates-operator"
 MTLS_NAME = "mtls"
+
+
+async def deploy_mtls_operator(
+    ops_test: OpsTest, encoded_client_certificate: str, encoded_client_ca: str
+):
+    # deploying mtls operator with certs
+    tls_config = {
+        "generate-self-signed-certificates": "false",
+        "certificate": encoded_client_certificate,
+        "ca-certificate": encoded_client_ca,
+    }
+
+    async with ops_test.fast_forward(fast_interval="30s"):
+        await ops_test.model.deploy(
+            TLS_NAME, channel="beta", config=tls_config, series="jammy", application_name=MTLS_NAME
+        )
+        await ops_test.model.wait_for_idle(apps=[MTLS_NAME], timeout=1000, idle_period=15)
+
+    return MTLS_NAME
 
 
 @pytest.mark.abort_on_fail
@@ -66,7 +86,7 @@ async def test_deploy_tls(ops_test: OpsTest, kafka_charm):
     assert ops_test.model.applications[TLS_NAME].status == "active"
 
     # Relate Zookeeper to TLS
-    async with ops_test.fast_forward():
+    async with ops_test.fast_forward(fast_interval="40s"):
         await ops_test.model.add_relation(TLS_NAME, ZK)
         await ops_test.model.wait_for_idle(apps=[TLS_NAME, ZK], idle_period=15)
 
@@ -82,7 +102,7 @@ async def test_kafka_tls(ops_test: OpsTest, app_charm):
     Afterwards, relate Kafka to TLS operator, which unblocks the application.
     """
     # Relate Zookeeper[TLS] to Kafka[Non-TLS]
-    async with ops_test.fast_forward():
+    async with ops_test.fast_forward(fast_interval="30s"):
         await ops_test.model.add_relation(ZK, CHARM_KEY)
         await ops_test.model.wait_for_idle(
             apps=[ZK], idle_period=15, timeout=1000, status="active"
@@ -99,11 +119,11 @@ async def test_kafka_tls(ops_test: OpsTest, app_charm):
         show_unit(f"{CHARM_KEY}/{num_unit}", model_full_name=ops_test.model_full_name), unit=0
     )
 
-    async with ops_test.fast_forward():
+    async with ops_test.fast_forward(fast_interval="30s"):
         await ops_test.model.add_relation(f"{CHARM_KEY}:{TLS_RELATION}", TLS_NAME)
         logger.info("Relate Kafka to TLS")
         await ops_test.model.wait_for_idle(
-            apps=[CHARM_KEY, ZK, TLS_NAME], idle_period=30, timeout=1200, status="active"
+            apps=[CHARM_KEY, ZK, TLS_NAME], idle_period=15, timeout=1200, status="active"
         )
 
     assert ops_test.model.applications[CHARM_KEY].status == "active"
@@ -112,18 +132,18 @@ async def test_kafka_tls(ops_test: OpsTest, app_charm):
     kafka_address = await get_address(ops_test=ops_test, app_name=CHARM_KEY)
     assert not check_tls(ip=kafka_address, port=SECURITY_PROTOCOL_PORTS["SASL_SSL"].client)
 
-    async with ops_test.fast_forward():
+    async with ops_test.fast_forward(fast_interval="40s"):
         await asyncio.gather(
             ops_test.model.deploy(
                 app_charm, application_name=DUMMY_NAME, num_units=1, series="jammy"
             ),
         )
         await ops_test.model.wait_for_idle(
-            apps=[CHARM_KEY, DUMMY_NAME], timeout=1000, idle_period=60
+            apps=[CHARM_KEY, DUMMY_NAME], timeout=1000, idle_period=30
         )
         await ops_test.model.add_relation(CHARM_KEY, f"{DUMMY_NAME}:{REL_NAME_ADMIN}")
         await ops_test.model.wait_for_idle(
-            apps=[CHARM_KEY, DUMMY_NAME], timeout=3600, idle_period=60, status="active"
+            apps=[CHARM_KEY, DUMMY_NAME], timeout=3600, idle_period=30, status="active"
         )
 
         assert ops_test.model.applications[CHARM_KEY].status == "active"
@@ -158,23 +178,9 @@ async def test_mtls(ops_test: OpsTest):
     )
     encoded_client_ca = base64.b64encode(client_ca.encode("utf-8")).decode("utf-8")
 
-    # deploying mtls operator with certs
-    tls_config = {
-        "generate-self-signed-certificates": "false",
-        "certificate": encoded_client_certificate,
-        "ca-certificate": encoded_client_ca,
-    }
-    await ops_test.model.deploy(
-        TLS_NAME, channel="beta", config=tls_config, series="jammy", application_name=MTLS_NAME
+    mtls_application = await deploy_mtls_operator(
+        ops_test, encoded_client_certificate, encoded_client_ca
     )
-    await ops_test.model.wait_for_idle(apps=[MTLS_NAME], timeout=1000, idle_period=15)
-    async with ops_test.fast_forward():
-        await ops_test.model.add_relation(
-            f"{CHARM_KEY}:{TRUSTED_CERTIFICATE_RELATION}", f"{MTLS_NAME}:{TLS_RELATION}"
-        )
-        await ops_test.model.wait_for_idle(
-            apps=[CHARM_KEY, MTLS_NAME], idle_period=60, timeout=2000, status="active"
-        )
 
     # getting kafka ca and address
     broker_ca = extract_ca(show_unit(f"{CHARM_KEY}/0", model_full_name=ops_test.model_full_name))
@@ -186,6 +192,15 @@ async def test_mtls(ops_test: OpsTest):
 
     # setting ACLs using normal sasl port
     await set_mtls_client_acls(ops_test, bootstrap_server=sasl_bootstrap_server)
+
+    # Test with trusted-cert relation
+    async with ops_test.fast_forward(fast_interval="30s"):
+        await ops_test.model.add_relation(
+            f"{CHARM_KEY}:{TRUSTED_CERTIFICATE_RELATION}", f"{mtls_application}:{TLS_RELATION}"
+        )
+        await ops_test.model.wait_for_idle(
+            apps=[CHARM_KEY, mtls_application], idle_period=15, timeout=300, status="active"
+        )
 
     num_messages = 10
 
@@ -217,6 +232,54 @@ async def test_mtls(ops_test: OpsTest):
     assert topic_name == "TEST-TOPIC"
     assert min_offset == "0"
     assert max_offset == str(num_messages)
+
+    await ops_test.model.remove_application(mtls_application)
+
+    # Push messages using CA
+
+    mtls_application_ca = await deploy_mtls_operator(
+        ops_test, encoded_client_certificate, encoded_client_ca
+    )
+
+    # Test with trusted-ca relation
+    async with ops_test.fast_forward(fast_interval="30s"):
+        await ops_test.model.add_relation(
+            f"{CHARM_KEY}:{TRUSTED_CA_RELATION}", f"{mtls_application_ca}:{TLS_RELATION}"
+        )
+        await ops_test.model.wait_for_idle(
+            apps=[CHARM_KEY, mtls_application_ca], idle_period=15, timeout=300, status="active"
+        )
+
+    num_messages_ca = 10
+
+    # running mtls producer
+    action = await ops_test.model.units.get(f"{DUMMY_NAME}/0").run_action(
+        "run-mtls-producer",
+        **{
+            "bootstrap-server": ssl_bootstrap_server,
+            "broker-ca": base64.b64encode(broker_ca.encode("utf-8")).decode("utf-8"),
+            "num-messages": num_messages,
+        },
+    )
+
+    response = await action.wait()
+
+    assert response.results.get("success", None) == "TRUE"
+
+    offsets_action = await ops_test.model.units.get(f"{DUMMY_NAME}/0").run_action(
+        "get-offsets",
+        **{
+            "bootstrap-server": ssl_bootstrap_server,
+        },
+    )
+
+    response = await offsets_action.wait()
+
+    topic_name, min_offset, max_offset = response.results["output"].strip().split(":")
+
+    assert topic_name == "TEST-TOPIC"
+    assert min_offset == "0"
+    assert max_offset == str(num_messages + num_messages_ca)
 
 
 @pytest.mark.abort_on_fail
