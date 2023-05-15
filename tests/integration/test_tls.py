@@ -233,7 +233,7 @@ async def test_mtls(ops_test: OpsTest):
     assert min_offset == "0"
     assert max_offset == str(num_messages)
 
-    await ops_test.model.remove_application(mtls_application)
+    await ops_test.model.remove_application(mtls_application, block_until_done=True)
 
     # Push messages using CA
 
