@@ -35,6 +35,7 @@ from literals import (
     OS_REQUIREMENTS,
     PEER,
     REL_NAME,
+    STORAGE,
     USER,
     DebugLevel,
     Status,
@@ -42,6 +43,7 @@ from literals import (
 )
 from managers.auth import AuthManager
 from managers.config import KafkaConfigManager
+from managers.cruisecontrol import CruiseControlManager
 from managers.tls import TLSManager
 from workload import KafkaWorkload
 
@@ -82,6 +84,9 @@ class KafkaCharm(TypedCharmBase[CharmConfig]):
         )
         self.tls_manager = TLSManager(self.state, self.workload, substrate=self.substrate)
         self.auth_manager = AuthManager(self.state, self.workload, self.config_manager.kafka_opts)
+        self.cruisecontrol_manager = CruiseControlManager(
+            self.state, self.workload, unit_storages=self.model.storages[STORAGE]
+        )
 
         # LIB HANDLERS
 
@@ -147,6 +152,8 @@ class KafkaCharm(TypedCharmBase[CharmConfig]):
 
     def _on_config_changed(self, event: EventBase) -> None:
         """Generic handler for most `config_changed` events across relations."""
+        # TODO: restart cruise-control if leader, and storage changed
+
         # only overwrite properties if service is already active
         if not self.healthy or not self.upgrade.idle:
             event.defer()
@@ -237,8 +244,13 @@ class KafkaCharm(TypedCharmBase[CharmConfig]):
 
     def _on_storage_attached(self, event: StorageAttachedEvent) -> None:
         """Handler for `storage_attached` events."""
-        # new dirs won't be used until topic partitions are assigned to it
-        # either automatically for new topics, or manually for existing
+        # storage-attached usually fires before relation-created/joined
+        if not self.state.peer_relation:
+            event.defer()
+            return
+
+        self.state.broker.update({"storages": self.cruisecontrol_manager.storages})
+
         # set status only for running services, not on startup
         if self.workload.active():
             self._set_status(Status.ADDED_STORAGE)
@@ -253,6 +265,8 @@ class KafkaCharm(TypedCharmBase[CharmConfig]):
             self._set_status(Status.REMOVED_STORAGE)
         else:
             self._set_status(Status.REMOVED_STORAGE_NO_REPL)
+
+        self.state.broker.update({"storages": self.cruisecontrol_manager.storages})
 
         self._on_config_changed(event)
 
